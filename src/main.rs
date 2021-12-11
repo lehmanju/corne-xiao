@@ -4,23 +4,48 @@
 use keyberon::matrix::Matrix;
 use usb_device::class_prelude::UsbBusAllocator;
 use usb_device::prelude::*;
-use xiao_m0::hal::sercom::v2::uart;
+use xiao_m0::hal::clock::GenericClockController;
+use xiao_m0::hal::sercom::v2::uart::{self, BaudMode, Config, Oversampling, Pads, Rx, Tx, Uart};
+use xiao_m0::hal::typelevel::NoneT;
 use xiao_m0::hal::usb::UsbBus;
 use xiao_m0::hal::{self as hal, timer};
+use xiao_m0::{usb_allocator, Pins};
 
-use hal::gpio::v2::{Floating, Input};
 use hal::prelude::*;
-use rtic::app;
 use keyberon::debounce::Debouncer;
 use keyberon::key_code::KbHidReport;
-use keyberon::layout::{Layout, Event};
-use keyberon::matrix::{PressedKeys};
+use keyberon::layout::{Event, Layout};
+use keyberon::matrix::PressedKeys;
 use panic_halt as _;
-use xiao_m0::hal::gpio::v2::DynPin;
-use xiao_m0::pac::{TC3, usb};
+use rtic::app;
+use xiao_m0::hal::gpio::v2::{Alternate, DynPin, Pin, D, PB08};
+use xiao_m0::pac::{usb, SERCOM4, TC3};
 
 type UsbClass = keyberon::Class<'static, UsbBus, ()>;
 type UsbDevice = usb_device::device::UsbDevice<'static, UsbBus>;
+type UartRx = Uart<Config<Pads<SERCOM4, Pin<PB08, Alternate<D>>>>, Rx>;
+type UartTx = Uart<Config<Pads<SERCOM4, NoneT, Pin<PB08, Alternate<D>>>>, Tx>;
+
+use panic_halt as _;
+
+mod layout;
+
+pub enum Serial<R, T> {
+    Rx(R),
+    Tx(T),
+}
+
+trait ResultExt<T> {
+    fn get(self) -> T;
+}
+impl<T> ResultExt<T> for Result<T, Infallible> {
+    fn get(self) -> T {
+        match self {
+            Ok(v) => v,
+            Err(e) => match e {},
+        }
+    }
+}
 
 #[app(device = crate::hal::pac, peripherals = true)]
 const APP: () = {
@@ -32,91 +57,114 @@ const APP: () = {
         timer: timer::TimerCounter<TC3>,
         layout: Layout<()>,
         transform: fn(Event) -> Event,
-        tx: uart::Tx,
-        rx: uart::Rx,
+        serial: Serial<UartRx, UartTx>,
     }
 
     #[init]
     fn init(mut c: init::Context) -> init::LateResources {
-        static mut USB_BUS: Option<UsbBusAllocator<usb::UsbBusType>> = None;
+        static mut USB_BUS: Option<UsbBusAllocator<UsbBus>> = None;
 
-        let mut rcc = c
-            .device
-            .RCC
-            .configure()
-            .hsi48()
-            .enable_crs(c.device.CRS)
-            .sysclk(48.mhz())
-            .pclk(24.mhz())
-            .freeze(&mut c.device.FLASH);
+        let peripherals = c.device;
+        let core = c.core;
 
-        let gpioa = c.device.GPIOA.split(&mut rcc);
-        let gpiob = c.device.GPIOB.split(&mut rcc);
+        // Initialize USB for keyberon
 
-        let usb = usb::Peripheral {
-            usb: c.device.USB,
-            pin_dm: gpioa.pa11,
-            pin_dp: gpioa.pa12,
-        };
-        *USB_BUS = Some(usb::UsbBusType::new(usb));
-        let usb_bus = USB_BUS.as_ref().unwrap();
+        let mut clocks = GenericClockController::with_external_32kosc(
+            peripherals.GCLK,
+            &mut peripherals.PM,
+            &mut peripherals.SYSCTRL,
+            &mut peripherals.NVMCTRL,
+        );
+        let pins = Pins::new(peripherals.PORT);
+        let bus_allocator = usb_allocator(
+            peripherals.USB,
+            &mut clocks,
+            &mut peripherals.PM,
+            pins.usb_dm,
+            pins.usb_dp,
+        );
 
-        let usb_class = keyberon::new_class(usb_bus, ());
-        let usb_dev = keyberon::new_device(usb_bus);
+        let usb_class = keyberon::new_class(&bus_allocator, ());
+        let usb_dev = keyberon::new_device(&bus_allocator);
 
-        let mut timer = timers::Timer::tim3(c.device.TIM3, 1.khz(), &mut rcc);
-        timer.listen(timers::Event::TimeOut);
+        // Configure timer
 
-        let pb12: &gpiob::PB12<Input<Floating>> = &gpiob.pb12;
-        let is_left = pb12.is_low().get();
+        let gclk0 = clocks.gclk0();
+        let timer_clock = clocks.tcc2_tc3(&gclk0).unwrap();
+        let mut timer =
+            timer::TimerCounter::tc3_(&timer_clock, peripherals.TC3, &mut peripherals.PM);
+        timer.start(1.khz());
+
+        // Left / Right hand side
+        // depends on whether USB communication is established or not
+
+        let is_left = usb_dev.state() == UsbDeviceState::Configured;
         let transform: fn(Event) -> Event = if is_left {
             |e| e
         } else {
             |e| e.transform(|i, j| (i, 11 - j))
         };
 
-        let (pa9, pa10) = (gpioa.pa9, gpioa.pa10);
-        let pins = cortex_m::interrupt::free(move |cs| {
-            (pa9.into_alternate_af1(cs), pa10.into_alternate_af1(cs))
-        });
-        let mut serial = serial::Serial::usart1(c.device.USART1, pins, 38_400.bps(), &mut rcc);
-        serial.listen(serial::Event::Rxne);
-        let (tx, rx) = serial.split();
+        // Setup Serial communication
+        let clock = &clocks.sercom4_core(&gclk0).unwrap();
+        let uart_pin = pins.a6;
+        let serial = if is_left {
+            let pads = uart::Pads::default().rx(uart_pin);
+            let uart =
+                uart::Config::new(&mut peripherals.PM, peripherals.SERCOM4, pads, clock.freq())
+                    .baud(
+                        38_400.bps().into(),
+                        BaudMode::Fractional(Oversampling::Bits16),
+                    )
+                    .enable();
+            Serial::Rx(uart)
+        } else {
+            let pads = uart::Pads::default().tx(uart_pin);
+            let uart =
+                uart::Config::new(&mut peripherals.PM, peripherals.SERCOM4, pads, clock.freq())
+                    .baud(
+                        38_400.bps().into(),
+                        BaudMode::Fractional(Oversampling::Bits16),
+                    )
+                    .enable();
+            Serial::Tx(uart)
+        };
 
-        let pa15 = gpioa.pa15;
-        let matrix = cortex_m::interrupt::free(move |cs| {
-            Matrix::new(
-                [
-                    pa15.into_pull_up_input(cs).downgrade(),
-                    gpiob.pb3.into_pull_up_input(cs).downgrade(),
-                    gpiob.pb4.into_pull_up_input(cs).downgrade(),
-                    gpiob.pb5.into_pull_up_input(cs).downgrade(),
-                    gpiob.pb8.into_pull_up_input(cs).downgrade(),
-                    gpiob.pb9.into_pull_up_input(cs).downgrade(),
-                ],
-                [
-                    gpiob.pb0.into_push_pull_output(cs).downgrade(),
-                    gpiob.pb1.into_push_pull_output(cs).downgrade(),
-                    gpiob.pb2.into_push_pull_output(cs).downgrade(),
-                    gpiob.pb10.into_push_pull_output(cs).downgrade(),
-                ],
-            )
-        });
+        // Setup keyboard matrix
+        let matrix = match Matrix::new(
+            [
+                pins.a0.into_pull_up_input().into(),
+                pins.a1.into_pull_up_input().into(),
+                pins.a3.into_pull_up_input().into(),
+                pins.a2.into_pull_up_input().into(),
+                pins.a5.into_pull_up_input().into(),
+                pins.a4.into_pull_up_input().into(),
+            ],
+            [
+                pins.a7.into_pull_up_input().into(),
+                pins.a8.into_pull_up_input().into(),
+                pins.a9.into_pull_up_input().into(),
+                pins.a10.into_pull_up_input().into(),
+            ],
+        ) {
+            Ok(val) => val,
+            Err(_) => panic!("Error creating matrix"),
+        };
+
 
         init::LateResources {
             usb_dev,
             usb_class,
             timer,
             debouncer: Debouncer::new(PressedKeys::default(), PressedKeys::default(), 5),
-            matrix: matrix.get(),
+            matrix,
             layout: Layout::new(crate::layout::LAYERS),
             transform,
-            tx,
-            rx,
+            serial,
         }
     }
 
-    #[task(binds = USART1, priority = 5, spawn = [handle_event], resources = [rx])]
+    #[task(binds = SERCOM4, priority = 5, spawn = [handle_event], resources = [serial])]
     fn rx(c: rx::Context) {
         static mut BUF: [u8; 4] = [0; 4];
 
@@ -166,10 +214,10 @@ const APP: () = {
     }
 
     #[task(
-        binds = TIM3,
+        binds = TC3,
         priority = 2,
         spawn = [handle_event, tick_keyberon],
-        resources = [matrix, debouncer, timer, &transform, tx],
+        resources = [matrix, debouncer, timer, &transform, serial],
     )]
     fn tick(c: tick::Context) {
         c.resources.timer.wait().ok();

@@ -7,7 +7,7 @@ edition = "2021"
 
 [dependencies]
 keyberon = { git = "https://github.com/TeXitoi/keyberon", branch = "master" }
-embedded-hal = { version= "0.2", features = ["unproven"]}
+embedded-hal = "0.2"
 usb-device = "0.2"
 xiao_m0 = { version= "0.11", features = ["unproven", "usb"]}
 cortex-m-rtic = "0.5"
