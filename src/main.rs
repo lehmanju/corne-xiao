@@ -63,11 +63,10 @@ const APP: () = {
     }
 
     #[init]
-    fn init(mut c: init::Context) -> init::LateResources {
+    fn init(c: init::Context) -> init::LateResources {
         static mut USB_BUS: Option<UsbBusAllocator<UsbBus>> = None;
 
-        let peripherals = c.device;
-        let core = c.core;
+        let mut peripherals = c.device;
 
         // Initialize USB for keyberon
 
@@ -78,16 +77,16 @@ const APP: () = {
             &mut peripherals.NVMCTRL,
         );
         let pins = Pins::new(peripherals.PORT);
-        let bus_allocator = usb_allocator(
+        *USB_BUS = Some(usb_allocator(
             peripherals.USB,
             &mut clocks,
             &mut peripherals.PM,
             pins.usb_dm,
             pins.usb_dp,
-        );
+        ));
 
-        let usb_class = keyberon::new_class(&bus_allocator, ());
-        let usb_dev = keyberon::new_device(&bus_allocator);
+        let usb_class = keyberon::new_class(USB_BUS.as_ref().unwrap(), ());
+        let usb_dev = keyberon::new_device(USB_BUS.as_ref().unwrap());
 
         // Configure timer
 
@@ -224,7 +223,7 @@ const APP: () = {
         spawn = [handle_event, tick_keyberon],
         resources = [serial, matrix, debouncer, timer, &transform],
     )]
-    fn tick(c: tick::Context) {
+    fn tick(mut c: tick::Context) {
         c.resources.timer.wait().ok();
 
         // check all events since last tick
