@@ -9,7 +9,7 @@ edition = "2021"
 keyberon = { git = "https://github.com/TeXitoi/keyberon", branch = "master" }
 embedded-hal = "0.2"
 usb-device = "0.2"
-xiao_m0 = { version= "0.11", features = ["unproven", "usb"]}
+xiao_m0 = { version="0.11", features = ["unproven", "usb"]}
 cortex-m-rtic = "0.5"
 panic-halt = "0.2"
 cortex-m = "0.7"
@@ -23,6 +23,3 @@ panic = "abort"
 debug = false
 lto = true
 opt-level = "s"
-
-[package.metadata]
-chip = "ATSAMD51P19A"

@@ -27,7 +27,6 @@ type KeybUsbClass = keyberon::Class<'static, UsbBus, ()>;
 type KeybUsbDevice = usb_device::device::UsbDevice<'static, UsbBus>;
 type UartRx = Uart<Config<Pads<SERCOM4, Pin<PB08, Alternate<D>>>>, Rx>;
 type UartTx = Uart<Config<Pads<SERCOM4, NoneT, Pin<PB08, Alternate<D>>>>, Tx>;
-
 use panic_halt as _;
 
 mod layout;
@@ -98,7 +97,9 @@ const APP: () = {
         let timer_clock = clocks.tcc2_tc3(&gclk0).unwrap();
         let mut timer =
             timer::TimerCounter::tc3_(&timer_clock, peripherals.TC3, &mut peripherals.PM);
+
         timer.start(1.khz());
+        timer.enable_interrupt();
 
         // Left / Right hand side
         // depends on whether USB communication is established or not
@@ -111,21 +112,20 @@ const APP: () = {
         };
 
         // Setup Serial communication
+
         let clock = &clocks.sercom4_core(&gclk0).unwrap();
         let uart_pin = pins.a6;
         let serial = if is_left {
             let pads = uart::Pads::default().rx(uart_pin);
-            let uart =
-                uart::Config::new(&mut peripherals.PM, peripherals.SERCOM4, pads, clock.freq())
-                    .baud(9600.hz(), BaudMode::Fractional(Oversampling::Bits16))
-                    .enable();
+            let uart = uart::Config::new(&peripherals.PM, peripherals.SERCOM4, pads, clock.freq())
+                .baud(9600.hz(), BaudMode::Fractional(Oversampling::Bits16))
+                .enable();
             Serial::Rx(uart)
         } else {
             let pads = uart::Pads::default().tx(uart_pin);
-            let uart =
-                uart::Config::new(&mut peripherals.PM, peripherals.SERCOM4, pads, clock.freq())
-                    .baud(9600.hz(), BaudMode::Fractional(Oversampling::Bits16))
-                    .enable();
+            let uart = uart::Config::new(&peripherals.PM, peripherals.SERCOM4, pads, clock.freq())
+                .baud(9600.hz(), BaudMode::Fractional(Oversampling::Bits16))
+                .enable();
             Serial::Tx(uart)
         };
 
@@ -140,10 +140,10 @@ const APP: () = {
                 pins.a4.into_pull_up_input().into(),
             ],
             [
-                pins.a7.into_pull_up_input().into(),
-                pins.a8.into_pull_up_input().into(),
-                pins.a9.into_pull_up_input().into(),
-                pins.a10.into_pull_up_input().into(),
+                pins.a7.into_push_pull_output().into(),
+                pins.a8.into_push_pull_output().into(),
+                pins.a9.into_push_pull_output().into(),
+                pins.a10.into_push_pull_output().into(),
             ],
         ) {
             Ok(val) => val,
@@ -204,9 +204,8 @@ const APP: () = {
         }
 
         // else check for custom reset event
-        match tick {
-            CustomEvent::Release(()) => unsafe { cortex_m::asm::bootload(0x1FFFC800 as _) },
-            _ => (),
+        if let CustomEvent::Release(()) = tick {
+            unsafe { cortex_m::asm::bootload(0x1FFFC800 as _) }
         }
 
         // generate and send keyboard report
@@ -221,15 +220,13 @@ const APP: () = {
         while let Ok(0) = c.resources.usb_class.lock(|k| k.write(report.as_bytes())) {}
     }
 
-    #[task(
-        binds = TC3,
+    #[task(binds = TC3,
         priority = 2,
         spawn = [handle_event, tick_keyberon],
-        resources = [serial, matrix, debouncer, timer, &transform],
+        resources = [serial, debouncer, timer, &transform, matrix],
     )]
     fn tick(mut c: tick::Context) {
         c.resources.timer.wait().ok();
-
         // check all events since last tick
         for event in c
             .resources
@@ -242,7 +239,7 @@ const APP: () = {
                 if let Serial::Tx(tx) = serial {
                     for &b in &ser(event) {
                         let res = block!(tx.write(b));
-                        if let Err(_) = res {
+                        if res.is_err() {
                             panic!("Error during serial write");
                         }
                     }
