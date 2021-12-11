@@ -5,6 +5,7 @@ use keyberon::matrix::Matrix;
 use usb_device::class_prelude::UsbBusAllocator;
 use usb_device::prelude::*;
 use xiao_m0::hal::clock::GenericClockController;
+use xiao_m0::hal::prelude::nb::block;
 use xiao_m0::hal::sercom::v2::uart::{self, BaudMode, Config, Oversampling, Pads, Rx, Tx, Uart};
 use xiao_m0::hal::typelevel::NoneT;
 use xiao_m0::hal::usb::UsbBus;
@@ -18,7 +19,7 @@ use keyberon::layout::{Event, Layout};
 use keyberon::matrix::PressedKeys;
 use panic_halt as _;
 use rtic::app;
-use xiao_m0::hal::gpio::v2::{Alternate, DynPin, Pin, D, PB08};
+use xiao_m0::hal::gpio::v2::{dynpin, Alternate, DynPin, Pin, D, PB08};
 use xiao_m0::pac::{usb, SERCOM4, TC3};
 
 type UsbClass = keyberon::Class<'static, UsbBus, ()>;
@@ -38,11 +39,11 @@ pub enum Serial<R, T> {
 trait ResultExt<T> {
     fn get(self) -> T;
 }
-impl<T> ResultExt<T> for Result<T, Infallible> {
+impl<T> ResultExt<T> for Result<T, dynpin::Error> {
     fn get(self) -> T {
         match self {
             Ok(v) => v,
-            Err(e) => match e {},
+            Err(_) => panic!("DynPin unwrap error"),
         }
     }
 }
@@ -112,20 +113,14 @@ const APP: () = {
             let pads = uart::Pads::default().rx(uart_pin);
             let uart =
                 uart::Config::new(&mut peripherals.PM, peripherals.SERCOM4, pads, clock.freq())
-                    .baud(
-                        38_400.bps().into(),
-                        BaudMode::Fractional(Oversampling::Bits16),
-                    )
+                    .baud(9600.hz(), BaudMode::Fractional(Oversampling::Bits16))
                     .enable();
             Serial::Rx(uart)
         } else {
             let pads = uart::Pads::default().tx(uart_pin);
             let uart =
                 uart::Config::new(&mut peripherals.PM, peripherals.SERCOM4, pads, clock.freq())
-                    .baud(
-                        38_400.bps().into(),
-                        BaudMode::Fractional(Oversampling::Bits16),
-                    )
+                    .baud(9600.hz(), BaudMode::Fractional(Oversampling::Bits16))
                     .enable();
             Serial::Tx(uart)
         };
@@ -151,7 +146,6 @@ const APP: () = {
             Err(_) => panic!("Error creating matrix"),
         };
 
-
         init::LateResources {
             usb_dev,
             usb_class,
@@ -167,8 +161,8 @@ const APP: () = {
     #[task(binds = SERCOM4, priority = 5, spawn = [handle_event], resources = [serial])]
     fn rx(c: rx::Context) {
         static mut BUF: [u8; 4] = [0; 4];
-
-        if let Ok(b) = c.resources.rx.read() {
+        /*
+        if let Ok(b) = c.resources.serial.read() {
             BUF.rotate_left(1);
             BUF[3] = b;
 
@@ -177,13 +171,13 @@ const APP: () = {
                     c.spawn.handle_event(event).unwrap();
                 }
             }
-        }
+        }*/
     }
 
     #[task(binds = USB, priority = 4, resources = [usb_dev, usb_class])]
     fn usb_rx(c: usb_rx::Context) {
         if c.resources.usb_dev.poll(&mut [c.resources.usb_class]) {
-            c.resources.usb_class.poll();
+            //c.resources.usb_class.poll();
         }
     }
 
@@ -198,10 +192,10 @@ const APP: () = {
         if c.resources.usb_dev.lock(|d| d.state()) != UsbDeviceState::Configured {
             return;
         }
-        match tick {
+        /* match tick {
             CustomEvent::Release(()) => unsafe { cortex_m::asm::bootload(0x1FFFC800 as _) },
             _ => (),
-        }
+        }*/
         let report: KbHidReport = c.resources.layout.keycodes().collect();
         if !c
             .resources
@@ -217,7 +211,7 @@ const APP: () = {
         binds = TC3,
         priority = 2,
         spawn = [handle_event, tick_keyberon],
-        resources = [matrix, debouncer, timer, &transform, serial],
+        resources = [serial, matrix, debouncer, timer, &transform],
     )]
     fn tick(c: tick::Context) {
         c.resources.timer.wait().ok();
@@ -228,15 +222,35 @@ const APP: () = {
             .events(c.resources.matrix.get().get())
             .map(c.resources.transform)
         {
-            for &b in &ser(event) {
-                block!(c.resources.tx.write(b)).get();
-            }
+            c.resources.serial.lock(|serial| {
+                if let Serial::Tx(tx) = serial {
+                    for &b in &ser(event) {
+                        let res = block!(tx.write(b));
+                    }
+                }
+            });
+
             c.spawn.handle_event(event).unwrap();
         }
         c.spawn.tick_keyberon().unwrap();
     }
 
     extern "C" {
-        fn CEC_CAN();
+        fn TC4();
+        fn TC5();
     }
 };
+
+fn de(bytes: &[u8]) -> Result<Event, ()> {
+    match *bytes {
+        [b'P', i, j, b'\n'] => Ok(Event::Press(i, j)),
+        [b'R', i, j, b'\n'] => Ok(Event::Release(i, j)),
+        _ => Err(()),
+    }
+}
+fn ser(e: Event) -> [u8; 4] {
+    match e {
+        Event::Press(i, j) => [b'P', i, j, b'\n'],
+        Event::Release(i, j) => [b'R', i, j, b'\n'],
+    }
+}
