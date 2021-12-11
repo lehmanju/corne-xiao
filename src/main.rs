@@ -15,15 +15,16 @@ use xiao_m0::{usb_allocator, Pins};
 use hal::prelude::*;
 use keyberon::debounce::Debouncer;
 use keyberon::key_code::KbHidReport;
-use keyberon::layout::{Event, Layout};
+use keyberon::layout::{CustomEvent, Event, Layout};
 use keyberon::matrix::PressedKeys;
 use panic_halt as _;
 use rtic::app;
+use usb_device::class::UsbClass;
 use xiao_m0::hal::gpio::v2::{dynpin, Alternate, DynPin, Pin, D, PB08};
-use xiao_m0::pac::{usb, SERCOM4, TC3};
+use xiao_m0::pac::{SERCOM4, TC3};
 
-type UsbClass = keyberon::Class<'static, UsbBus, ()>;
-type UsbDevice = usb_device::device::UsbDevice<'static, UsbBus>;
+type KeybUsbClass = keyberon::Class<'static, UsbBus, ()>;
+type KeybUsbDevice = usb_device::device::UsbDevice<'static, UsbBus>;
 type UartRx = Uart<Config<Pads<SERCOM4, Pin<PB08, Alternate<D>>>>, Rx>;
 type UartTx = Uart<Config<Pads<SERCOM4, NoneT, Pin<PB08, Alternate<D>>>>, Tx>;
 
@@ -51,8 +52,8 @@ impl<T> ResultExt<T> for Result<T, dynpin::Error> {
 #[app(device = crate::hal::pac, peripherals = true)]
 const APP: () = {
     struct Resources {
-        usb_dev: UsbDevice,
-        usb_class: UsbClass,
+        usb_dev: KeybUsbDevice,
+        usb_class: KeybUsbClass,
         matrix: Matrix<DynPin, DynPin, 6, 4>,
         debouncer: Debouncer<PressedKeys<6, 4>>,
         timer: timer::TimerCounter<TC3>,
@@ -161,23 +162,28 @@ const APP: () = {
     #[task(binds = SERCOM4, priority = 5, spawn = [handle_event], resources = [serial])]
     fn rx(c: rx::Context) {
         static mut BUF: [u8; 4] = [0; 4];
-        /*
-        if let Ok(b) = c.resources.serial.read() {
-            BUF.rotate_left(1);
-            BUF[3] = b;
 
-            if BUF[3] == b'\n' {
-                if let Ok(event) = de(&BUF[..]) {
-                    c.spawn.handle_event(event).unwrap();
+        // receive events from other half
+        // spawn event handler
+        let serial = c.resources.serial;
+        if let Serial::Rx(rx) = serial {
+            if let Ok(b) = rx.read() {
+                BUF.rotate_left(1);
+                BUF[3] = b;
+
+                if BUF[3] == b'\n' {
+                    if let Ok(event) = de(&BUF[..]) {
+                        c.spawn.handle_event(event).unwrap();
+                    }
                 }
             }
-        }*/
+        }
     }
 
     #[task(binds = USB, priority = 4, resources = [usb_dev, usb_class])]
     fn usb_rx(c: usb_rx::Context) {
         if c.resources.usb_dev.poll(&mut [c.resources.usb_class]) {
-            //c.resources.usb_class.poll();
+            c.resources.usb_class.poll();
         }
     }
 
@@ -189,13 +195,18 @@ const APP: () = {
     #[task(priority = 3, resources = [usb_dev, usb_class, layout])]
     fn tick_keyberon(mut c: tick_keyberon::Context) {
         let tick = c.resources.layout.tick();
+        // if right-hand side do nothing, events have already been sent
         if c.resources.usb_dev.lock(|d| d.state()) != UsbDeviceState::Configured {
             return;
         }
-        /* match tick {
+
+        // else check for custom reset event
+        match tick {
             CustomEvent::Release(()) => unsafe { cortex_m::asm::bootload(0x1FFFC800 as _) },
             _ => (),
-        }*/
+        }
+
+        // generate and send keyboard report
         let report: KbHidReport = c.resources.layout.keycodes().collect();
         if !c
             .resources
@@ -216,22 +227,29 @@ const APP: () = {
     fn tick(c: tick::Context) {
         c.resources.timer.wait().ok();
 
+        // check all events since last tick
         for event in c
             .resources
             .debouncer
             .events(c.resources.matrix.get().get())
             .map(c.resources.transform)
         {
+            // send events to other keyboard half if right side
             c.resources.serial.lock(|serial| {
                 if let Serial::Tx(tx) = serial {
                     for &b in &ser(event) {
                         let res = block!(tx.write(b));
+                        if let Err(_) = res {
+                            panic!("Error during serial write");
+                        }
                     }
                 }
             });
 
+            // schedule handle_event
             c.spawn.handle_event(event).unwrap();
         }
+        // schedule keyberon tick
         c.spawn.tick_keyberon().unwrap();
     }
 

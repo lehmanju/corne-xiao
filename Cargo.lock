@@ -222,6 +222,7 @@ dependencies = [
 name = "crkbdr"
 version = "0.1.0"
 dependencies = [
+ "cortex-m 0.7.3",
  "cortex-m-rtic",
  "embedded-hal",
  "keyberon",
