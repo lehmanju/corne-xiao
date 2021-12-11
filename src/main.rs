@@ -49,6 +49,9 @@ impl<T> ResultExt<T> for Result<T, dynpin::Error> {
     }
 }
 
+static mut USB_ALLOCATOR: Option<UsbBusAllocator<UsbBus>> = None;
+//static mut USB_BUS: Option<UsbDevice<UsbBus>> = None;
+
 #[app(device = crate::hal::pac, peripherals = true)]
 const APP: () = {
     struct Resources {
@@ -64,29 +67,30 @@ const APP: () = {
 
     #[init]
     fn init(c: init::Context) -> init::LateResources {
-        static mut USB_BUS: Option<UsbBusAllocator<UsbBus>> = None;
-
         let mut peripherals = c.device;
 
         // Initialize USB for keyberon
 
-        let mut clocks = GenericClockController::with_external_32kosc(
+        let mut clocks = GenericClockController::with_internal_32kosc(
             peripherals.GCLK,
             &mut peripherals.PM,
             &mut peripherals.SYSCTRL,
             &mut peripherals.NVMCTRL,
         );
         let pins = Pins::new(peripherals.PORT);
-        *USB_BUS = Some(usb_allocator(
-            peripherals.USB,
-            &mut clocks,
-            &mut peripherals.PM,
-            pins.usb_dm,
-            pins.usb_dp,
-        ));
+        let bus_allocator = unsafe {
+            USB_ALLOCATOR = Some(usb_allocator(
+                peripherals.USB,
+                &mut clocks,
+                &mut peripherals.PM,
+                pins.usb_dm,
+                pins.usb_dp,
+            ));
+            USB_ALLOCATOR.as_ref().unwrap()
+        };
 
-        let usb_class = keyberon::new_class(USB_BUS.as_ref().unwrap(), ());
-        let usb_dev = keyberon::new_device(USB_BUS.as_ref().unwrap());
+        let usb_class = keyberon::new_class(bus_allocator, ());
+        let usb_dev = keyberon::new_device(bus_allocator);
 
         // Configure timer
 
