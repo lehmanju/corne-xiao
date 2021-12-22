@@ -6,7 +6,9 @@ use usb_device::class_prelude::UsbBusAllocator;
 use usb_device::prelude::*;
 use xiao_m0::hal::clock::GenericClockController;
 use xiao_m0::hal::prelude::nb::block;
-use xiao_m0::hal::sercom::v2::uart::{self, BaudMode, Config, Oversampling, Pads, Rx, Tx, Uart};
+use xiao_m0::hal::sercom::v2::uart::{
+    self, BaudMode, Config, Flags, Oversampling, Pads, Rx, Tx, Uart,
+};
 use xiao_m0::hal::typelevel::NoneT;
 use xiao_m0::hal::usb::UsbBus;
 use xiao_m0::hal::{self as hal, timer};
@@ -22,6 +24,7 @@ use rtic::app;
 use usb_device::class::UsbClass;
 use xiao_m0::hal::gpio::v2::{dynpin, Alternate, DynPin, Pin, D, PB08};
 use xiao_m0::pac::{SERCOM4, TC3};
+use xiao_m0::Led0;
 
 type KeybUsbClass = keyberon::Class<'static, UsbBus, ()>;
 type KeybUsbDevice = usb_device::device::UsbDevice<'static, UsbBus>;
@@ -59,6 +62,7 @@ const APP: () = {
         serial_receiver: UartRx,
         #[cfg(not(feature = "host"))]
         serial_sender: UartTx,
+        led: Led0,
     }
 
     #[init]
@@ -127,13 +131,17 @@ const APP: () = {
             Err(_) => panic!("Error creating matrix"),
         };
 
+        let mut led: Led0 = pins.led0.into_push_pull_output();
         #[cfg(feature = "host")]
         {
             let serial_receiver = {
                 let pads = uart::Pads::default().rx(uart_pin);
-                uart::Config::new(&peripherals.PM, peripherals.SERCOM4, pads, clock.freq())
-                    .baud(9600.hz(), BaudMode::Fractional(Oversampling::Bits16))
-                    .enable()
+                let mut uart =
+                    uart::Config::new(&peripherals.PM, peripherals.SERCOM4, pads, clock.freq())
+                        .baud(9600.hz(), BaudMode::Fractional(Oversampling::Bits16))
+                        .enable();
+                uart.enable_interrupts(Flags::RXC);
+                uart
             };
             init::LateResources {
                 usb_dev,
@@ -143,10 +151,12 @@ const APP: () = {
                 matrix,
                 layout: Layout::new(crate::layout::LAYERS),
                 serial_receiver,
+                led,
             }
         }
         #[cfg(not(feature = "host"))]
         {
+            led.toggle().unwrap();
             let serial_sender = {
                 let pads = uart::Pads::default().tx(uart_pin);
                 uart::Config::new(&peripherals.PM, peripherals.SERCOM4, pads, clock.freq())
@@ -161,16 +171,18 @@ const APP: () = {
                 matrix,
                 layout: Layout::new(crate::layout::LAYERS),
                 serial_sender,
+                led,
             }
         }
     }
 
-    #[task(binds = SERCOM4, priority = 5, spawn = [handle_event], resources = [serial_receiver])]
+    #[task(binds = SERCOM4, priority = 5, spawn = [handle_event], resources = [serial_receiver, led])]
     fn rx(c: rx::Context) {
         static mut BUF: [u8; 4] = [0; 4];
 
         #[cfg(feature = "host")]
         {
+            c.resources.led.toggle().unwrap();
             // receive events from other half
             // spawn event handler
             let serial_rx = c.resources.serial_receiver;
@@ -227,7 +239,7 @@ const APP: () = {
     #[task(binds = TC3,
         priority = 2,
         spawn = [handle_event, tick_keyberon],
-        resources = [serial_sender, debouncer, timer, matrix],
+        resources = [serial_sender, debouncer, timer, matrix, led],
     )]
     fn tick(mut c: tick::Context) {
         c.resources.timer.wait().ok();
@@ -235,6 +247,7 @@ const APP: () = {
         for event in c.resources.debouncer.events(c.resources.matrix.get().get()) {
             #[cfg(not(feature = "host"))]
             {
+                c.resources.led.toggle().unwrap();
                 for &b in &ser(event.transform(|i, j| (i, 11 - j))) {
                     let res = block!(c.resources.serial_sender.write(b));
                     if res.is_err() {
