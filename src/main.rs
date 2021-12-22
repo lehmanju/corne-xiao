@@ -31,11 +31,6 @@ use panic_halt as _;
 
 mod layout;
 
-pub enum Serial<R, T> {
-    Rx(R),
-    Tx(T),
-}
-
 trait ResultExt<T> {
     fn get(self) -> T;
 }
@@ -60,8 +55,10 @@ const APP: () = {
         debouncer: Debouncer<PressedKeys<6, 4>>,
         timer: timer::TimerCounter<TC3>,
         layout: Layout<()>,
-        transform: fn(Event) -> Event,
-        serial: Serial<UartRx, UartTx>,
+        #[cfg(feature = "host")]
+        serial_receiver: UartRx,
+        #[cfg(not(feature = "host"))]
+        serial_sender: UartTx,
     }
 
     #[init]
@@ -104,30 +101,10 @@ const APP: () = {
         // Left / Right hand side
         // depends on whether USB communication is established or not
 
-        let is_left = usb_dev.state() == UsbDeviceState::Configured;
-        let transform: fn(Event) -> Event = if is_left {
-            |e| e
-        } else {
-            |e| e.transform(|i, j| (i, 11 - j))
-        };
-
         // Setup Serial communication
 
         let clock = &clocks.sercom4_core(&gclk0).unwrap();
         let uart_pin = pins.a6;
-        let serial = if is_left {
-            let pads = uart::Pads::default().rx(uart_pin);
-            let uart = uart::Config::new(&peripherals.PM, peripherals.SERCOM4, pads, clock.freq())
-                .baud(9600.hz(), BaudMode::Fractional(Oversampling::Bits16))
-                .enable();
-            Serial::Rx(uart)
-        } else {
-            let pads = uart::Pads::default().tx(uart_pin);
-            let uart = uart::Config::new(&peripherals.PM, peripherals.SERCOM4, pads, clock.freq())
-                .baud(9600.hz(), BaudMode::Fractional(Oversampling::Bits16))
-                .enable();
-            Serial::Tx(uart)
-        };
 
         // Setup keyboard matrix
         let matrix = match Matrix::new(
@@ -150,27 +127,54 @@ const APP: () = {
             Err(_) => panic!("Error creating matrix"),
         };
 
-        init::LateResources {
-            usb_dev,
-            usb_class,
-            timer,
-            debouncer: Debouncer::new(PressedKeys::default(), PressedKeys::default(), 5),
-            matrix,
-            layout: Layout::new(crate::layout::LAYERS),
-            transform,
-            serial,
+        #[cfg(feature = "host")]
+        {
+            let serial_receiver = {
+                let pads = uart::Pads::default().rx(uart_pin);
+                uart::Config::new(&peripherals.PM, peripherals.SERCOM4, pads, clock.freq())
+                    .baud(9600.hz(), BaudMode::Fractional(Oversampling::Bits16))
+                    .enable()
+            };
+            init::LateResources {
+                usb_dev,
+                usb_class,
+                timer,
+                debouncer: Debouncer::new(PressedKeys::default(), PressedKeys::default(), 5),
+                matrix,
+                layout: Layout::new(crate::layout::LAYERS),
+                serial_receiver,
+            }
+        }
+        #[cfg(not(feature = "host"))]
+        {
+            let serial_sender = {
+                let pads = uart::Pads::default().tx(uart_pin);
+                uart::Config::new(&peripherals.PM, peripherals.SERCOM4, pads, clock.freq())
+                    .baud(9600.hz(), BaudMode::Fractional(Oversampling::Bits16))
+                    .enable()
+            };
+            init::LateResources {
+                usb_dev,
+                usb_class,
+                timer,
+                debouncer: Debouncer::new(PressedKeys::default(), PressedKeys::default(), 5),
+                matrix,
+                layout: Layout::new(crate::layout::LAYERS),
+                serial_sender,
+            }
         }
     }
 
-    #[task(binds = SERCOM4, priority = 5, spawn = [handle_event], resources = [serial])]
+    #[task(binds = SERCOM4, priority = 5, spawn = [handle_event], resources = [serial_receiver])]
     fn rx(c: rx::Context) {
         static mut BUF: [u8; 4] = [0; 4];
 
-        // receive events from other half
-        // spawn event handler
-        let serial = c.resources.serial;
-        if let Serial::Rx(rx) = serial {
-            if let Ok(b) = rx.read() {
+        #[cfg(feature = "host")]
+        {
+            // receive events from other half
+            // spawn event handler
+            let serial_rx = c.resources.serial_receiver;
+            if let Ok(b) = serial_rx.read() {
                 BUF.rotate_left(1);
                 BUF[3] = b;
 
@@ -223,31 +227,26 @@ const APP: () = {
     #[task(binds = TC3,
         priority = 2,
         spawn = [handle_event, tick_keyberon],
-        resources = [serial, debouncer, timer, &transform, matrix],
+        resources = [serial_sender, debouncer, timer, matrix],
     )]
     fn tick(mut c: tick::Context) {
         c.resources.timer.wait().ok();
         // check all events since last tick
-        for event in c
-            .resources
-            .debouncer
-            .events(c.resources.matrix.get().get())
-            .map(c.resources.transform)
-        {
-            // send events to other keyboard half if right side
-            c.resources.serial.lock(|serial| {
-                if let Serial::Tx(tx) = serial {
-                    for &b in &ser(event) {
-                        let res = block!(tx.write(b));
-                        if res.is_err() {
-                            panic!("Error during serial write");
-                        }
+        for event in c.resources.debouncer.events(c.resources.matrix.get().get()) {
+            #[cfg(not(feature = "host"))]
+            {
+                for &b in &ser(event.transform(|i, j| (i, 11 - j))) {
+                    let res = block!(c.resources.serial_sender.write(b));
+                    if res.is_err() {
+                        panic!("Error during serial write");
                     }
                 }
-            });
+            }
 
             // schedule handle_event
-            c.spawn.handle_event(event).unwrap();
+            {
+                c.spawn.handle_event(event).unwrap();
+            }
         }
         // schedule keyberon tick
         c.spawn.tick_keyberon().unwrap();
