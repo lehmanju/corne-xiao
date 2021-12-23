@@ -201,10 +201,11 @@ const APP: () = {
             return;
         }
 
+        /*
         // else check for custom reset event
         if let CustomEvent::Release(()) = tick {
             unsafe { cortex_m::asm::bootload(0x1FFFC800 as _) }
-        }
+        }*/
 
         // generate and send keyboard report
         let report: KbHidReport = c.resources.layout.keycodes().collect();
