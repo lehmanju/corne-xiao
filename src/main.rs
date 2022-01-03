@@ -197,7 +197,7 @@ const APP: () = {
     fn tick_keyberon(mut c: tick_keyberon::Context) {
         let tick = c.resources.layout.tick();
         // if right-hand side do nothing, events have already been sent
-        if c.resources.usb_dev.lock(|d| d.state()) != UsbDeviceState::Configured {
+        if c.resources.usb_dev.lock(|d| d.state()) == UsbDeviceState::Default {
             return;
         }
 
