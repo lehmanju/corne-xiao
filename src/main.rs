@@ -9,6 +9,7 @@ use xiao_m0::hal::prelude::nb::block;
 use xiao_m0::hal::sercom::v2::uart::{
     self, BaudMode, Config, Flags, Oversampling, Pads, Rx, Tx, Uart,
 };
+use xiao_m0::hal::time::Hertz;
 use xiao_m0::hal::typelevel::NoneT;
 use xiao_m0::hal::usb::UsbBus;
 use xiao_m0::hal::{self as hal, timer};
@@ -23,8 +24,7 @@ use panic_halt as _;
 use rtic::app;
 use usb_device::class::UsbClass;
 use xiao_m0::hal::gpio::v2::{dynpin, Alternate, DynPin, Pin, D, PB08};
-use xiao_m0::pac::{SERCOM4, TC3};
-use xiao_m0::Led0;
+use xiao_m0::pac::{PM, SERCOM4, TC3};
 
 type KeybUsbClass = keyberon::Class<'static, UsbBus, ()>;
 type KeybUsbDevice = usb_device::device::UsbDevice<'static, UsbBus>;
@@ -33,6 +33,16 @@ type UartTx = Uart<Config<Pads<SERCOM4, NoneT, Pin<PB08, Alternate<D>>>>, Tx>;
 use panic_halt as _;
 
 mod layout;
+
+pub enum Serial<R, T> {
+    Rx(R),
+    Tx(T),
+}
+
+pub struct SerialPeripherals {
+    frequency: Hertz,
+    pm: PM,
+}
 
 trait ResultExt<T> {
     fn get(self) -> T;
@@ -58,11 +68,8 @@ const APP: () = {
         debouncer: Debouncer<PressedKeys<6, 4>>,
         timer: timer::TimerCounter<TC3>,
         layout: Layout<()>,
-        #[cfg(feature = "host")]
-        serial_receiver: UartRx,
-        #[cfg(not(feature = "host"))]
-        serial_sender: UartTx,
-        led: Led0,
+        serial: Option<Serial<UartRx, UartTx>>,
+        serial_peripherals: SerialPeripherals,
     }
 
     #[init]
@@ -102,13 +109,23 @@ const APP: () = {
         timer.start(1.khz());
         timer.enable_interrupt();
 
-        // Left / Right hand side
-        // depends on whether USB communication is established or not
-
         // Setup Serial communication
+        // default configuration is for sending
 
         let clock = &clocks.sercom4_core(&gclk0).unwrap();
         let uart_pin = pins.a6;
+        let serial = {
+            let pads = uart::Pads::default().tx(uart_pin);
+            let uart = uart::Config::new(&peripherals.PM, peripherals.SERCOM4, pads, clock.freq())
+                .baud(9600.hz(), BaudMode::Fractional(Oversampling::Bits16))
+                .enable();
+            Some(Serial::Tx(uart))
+        };
+
+        let serial_peripherals = SerialPeripherals {
+            frequency: clock.freq(),
+            pm: peripherals.PM,
+        };
 
         // Setup keyboard matrix
         let matrix = match Matrix::new(
@@ -131,48 +148,15 @@ const APP: () = {
             Err(_) => panic!("Error creating matrix"),
         };
 
-        let mut led: Led0 = pins.led0.into_push_pull_output();
-        #[cfg(feature = "host")]
-        {
-            let serial_receiver = {
-                let pads = uart::Pads::default().rx(uart_pin);
-                let mut uart =
-                    uart::Config::new(&peripherals.PM, peripherals.SERCOM4, pads, clock.freq())
-                        .baud(9600.hz(), BaudMode::Fractional(Oversampling::Bits16))
-                        .enable();
-                uart.enable_interrupts(Flags::RXC);
-                uart
-            };
-            init::LateResources {
-                usb_dev,
-                usb_class,
-                timer,
-                debouncer: Debouncer::new(PressedKeys::default(), PressedKeys::default(), 5),
-                matrix,
-                layout: Layout::new(crate::layout::LAYERS),
-                serial_receiver,
-                led,
-            }
-        }
-        #[cfg(not(feature = "host"))]
-        {
-            led.toggle().unwrap();
-            let serial_sender = {
-                let pads = uart::Pads::default().tx(uart_pin);
-                uart::Config::new(&peripherals.PM, peripherals.SERCOM4, pads, clock.freq())
-                    .baud(9600.hz(), BaudMode::Fractional(Oversampling::Bits16))
-                    .enable()
-            };
-            init::LateResources {
-                usb_dev,
-                usb_class,
-                timer,
-                debouncer: Debouncer::new(PressedKeys::default(), PressedKeys::default(), 5),
-                matrix,
-                layout: Layout::new(crate::layout::LAYERS),
-                serial_sender,
-                led,
-            }
+        init::LateResources {
+            usb_dev,
+            usb_class,
+            timer,
+            debouncer: Debouncer::new(PressedKeys::default(), PressedKeys::default(), 5),
+            matrix,
+            layout: Layout::new(crate::layout::LAYERS),
+            serial,
+            serial_peripherals,
         }
     }
 
@@ -180,13 +164,11 @@ const APP: () = {
     fn rx(c: rx::Context) {
         static mut BUF: [u8; 4] = [0; 4];
 
-        #[cfg(feature = "host")]
-        {
-            c.resources.led.toggle().unwrap();
-            // receive events from other half
-            // spawn event handler
-            let serial_rx = c.resources.serial_receiver;
-            if let Ok(b) = serial_rx.read() {
+        // receive events from other half
+        // spawn event handler
+        let serial = c.resources.serial.as_mut().unwrap();
+        if let Serial::Rx(rx) = serial {
+            if let Ok(b) = rx.read() {
                 BUF.rotate_left(1);
                 BUF[3] = b;
 
@@ -215,14 +197,15 @@ const APP: () = {
     fn tick_keyberon(mut c: tick_keyberon::Context) {
         let tick = c.resources.layout.tick();
         // if right-hand side do nothing, events have already been sent
-        if c.resources.usb_dev.lock(|d| d.state()) != UsbDeviceState::Configured {
+        if c.resources.usb_dev.lock(|d| d.state()) == UsbDeviceState::Default {
             return;
         }
 
+        /*
         // else check for custom reset event
         if let CustomEvent::Release(()) = tick {
             unsafe { cortex_m::asm::bootload(0x1FFFC800 as _) }
-        }
+        }*/
 
         // generate and send keyboard report
         let report: KbHidReport = c.resources.layout.keycodes().collect();
@@ -239,19 +222,87 @@ const APP: () = {
     #[task(binds = TC3,
         priority = 2,
         spawn = [handle_event, tick_keyberon],
-        resources = [serial_sender, debouncer, timer, matrix, led],
+        resources = [serial, serial_peripherals, debouncer, timer, matrix, usb_dev],
     )]
     fn tick(mut c: tick::Context) {
         c.resources.timer.wait().ok();
+
+        let mut receiving = false;
+
+        // determine send/receive half
+        c.resources.usb_dev.lock(|dev| {
+            if dev.state() == UsbDeviceState::Configured {
+                // receiving on uart
+                receiving = true;
+            }
+        });
+
+        c.resources.serial.lock(|serial| {
+            let value = serial.take().unwrap();
+            let result = match value {
+                Serial::Rx(rx) => {
+                    if !receiving {
+                        let (sercom, pads) = rx.disable().free();
+                        let uart_pin = pads.free().0;
+                        let pads = uart::Pads::default().tx(uart_pin);
+                        let uart = uart::Config::new(
+                            &c.resources.serial_peripherals.pm,
+                            sercom,
+                            pads,
+                            c.resources.serial_peripherals.frequency,
+                        )
+                        .baud(9600.hz(), BaudMode::Fractional(Oversampling::Bits16))
+                        .enable();
+
+                        Serial::Tx(uart)
+                    } else {
+                        Serial::Rx(rx)
+                    }
+                }
+                Serial::Tx(tx) => {
+                    if receiving {
+                        let (sercom, pads) = tx.disable().free();
+                        let uart_pin = pads.free().1;
+                        let pads = uart::Pads::default().rx(uart_pin);
+                        let mut uart = uart::Config::new(
+                            &c.resources.serial_peripherals.pm,
+                            sercom,
+                            pads,
+                            c.resources.serial_peripherals.frequency,
+                        )
+                        .baud(9600.hz(), BaudMode::Fractional(Oversampling::Bits16))
+                        .enable();
+                        uart.enable_interrupts(Flags::RXC);
+                        Serial::Rx(uart)
+                    } else {
+                        Serial::Tx(tx)
+                    }
+                }
+            };
+            serial.replace(result);
+        });
+
         // check all events since last tick
-        for event in c.resources.debouncer.events(c.resources.matrix.get().get()) {
-            #[cfg(not(feature = "host"))]
-            {
-                c.resources.led.toggle().unwrap();
-                for &b in &ser(event.transform(|i, j| (i, 11 - j))) {
-                    let res = block!(c.resources.serial_sender.write(b));
-                    if res.is_err() {
-                        panic!("Error during serial write");
+        for event in c
+            .resources
+            .debouncer
+            .events(c.resources.matrix.get().get())
+            .map(|e| {
+                if cfg!(feature = "right") {
+                    e.transform(|i, j| (i, 11 - j))
+                } else {
+                    e
+                }
+            })
+        {
+            // send events to other keyboard half if right side
+            c.resources.serial.lock(|serial| {
+                if let Serial::Tx(tx) = serial.as_mut().unwrap() {
+                    for &b in &ser(event) {
+                        let res = block!(tx.write(b));
+                        if res.is_err() {
+                            panic!("Error during serial write");
+                        }
                     }
                 }
             }

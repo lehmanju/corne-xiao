@@ -25,4 +25,4 @@ lto = true
 opt-level = "s"
 
 [features]
-host = []
+right = []
