@@ -16,3 +16,6 @@ cargo build --release
 
 ## Adjust layout
 Look into `layout.rs` and change your keymap.
+
+## Build yourself
+The schematic and pcb can be found in `corne-chocolate.zip`.
