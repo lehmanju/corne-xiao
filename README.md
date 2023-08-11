@@ -2,16 +2,22 @@
 Rust firmware for crkbd with Seeeduino Xiao
 
 ## Build and flash
-Because of the limited amount of pins on the Seeeduino Xiao, two different versions of the firmware have to be flashed to both halves. Also, because of issues with the default bootloader, this firmware needs to be flashed via a programmer (e.g. Blackmagic Probe, etc.). It is still unclear as to why the bootloader doesn't work.
+Because of the limited amount of pins on the Seeeduino Xiao, there are two different versions of the firmware, one for each half. Flashing is done via `cargo hf2`.
 
-Build right-hand side:
+Install `cargo-hf2`:
+
 ```
-cargo build --release --features right
+cargo install cargo-hf2
 ```
 
-Build left-hand side:
+Build and flash right-hand side:
 ```
-cargo build --release
+cargo hf2 --release --features right
+```
+
+Build and flash left-hand side:
+```
+cargo hf2 --release
 ```
 
 ## Adjust layout
