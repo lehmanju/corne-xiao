@@ -18,8 +18,7 @@ use xiao_m0::{usb_allocator, Pins};
 use hal::prelude::*;
 use keyberon::debounce::Debouncer;
 use keyberon::key_code::KbHidReport;
-use keyberon::layout::{CustomEvent, Event, Layout};
-use keyberon::matrix::PressedKeys;
+use keyberon::layout::{Event, Layout};
 use panic_halt as _;
 use rtic::app;
 use usb_device::class::UsbClass;
@@ -59,21 +58,29 @@ impl<T> ResultExt<T> for Result<T, dynpin::Error> {
 static mut USB_ALLOCATOR: Option<UsbBusAllocator<UsbBus>> = None;
 //static mut USB_BUS: Option<UsbDevice<UsbBus>> = None;
 
-#[app(device = crate::hal::pac, peripherals = true)]
-const APP: () = {
-    struct Resources {
+#[app(device = crate::hal::pac, peripherals = true, dispatchers = [TC4, TC5])]
+mod app {
+    use super::*;
+    #[shared]
+    struct Shared {
         usb_dev: KeybUsbDevice,
         usb_class: KeybUsbClass,
-        matrix: Matrix<DynPin, DynPin, 6, 4>,
-        debouncer: Debouncer<PressedKeys<6, 4>>,
-        timer: timer::TimerCounter<TC3>,
-        layout: Layout<()>,
+        #[lock_free]
+        layout: Layout<12, 4, 1, ()>,
         serial: Option<Serial<UartRx, UartTx>>,
+    }
+
+    #[local]
+    struct Local {
+        matrix: Matrix<DynPin, DynPin, 6, 4>,
+        debouncer: Debouncer<[[bool; 6]; 4]>,
+        timer: timer::TimerCounter<TC3>,
+        buf: [u8; 4],
         serial_peripherals: SerialPeripherals,
     }
 
     #[init]
-    fn init(c: init::Context) -> init::LateResources {
+    fn init(c: init::Context) -> (Shared, Local, init::Monotonics) {
         let mut peripherals = c.device;
 
         // Initialize USB for keyberon
@@ -148,56 +155,63 @@ const APP: () = {
             Err(_) => panic!("Error creating matrix"),
         };
 
-        init::LateResources {
-            usb_dev,
-            usb_class,
-            timer,
-            debouncer: Debouncer::new(PressedKeys::default(), PressedKeys::default(), 5),
-            matrix,
-            layout: Layout::new(crate::layout::LAYERS),
-            serial,
-            serial_peripherals,
-        }
+        (
+            Shared {
+                usb_dev,
+                usb_class,
+                layout: Layout::new(&crate::layout::LAYERS),
+                serial,
+            },
+            Local {
+                timer,
+                debouncer: Debouncer::new([[false; 6]; 4], [[false; 6]; 4], 5),
+                matrix,
+                buf: [0; 4],
+                serial_peripherals,
+            },
+            init::Monotonics(),
+        )
     }
 
-    #[task(binds = SERCOM4, priority = 5, spawn = [handle_event], resources = [serial_receiver, led])]
-    fn rx(c: rx::Context) {
-        static mut BUF: [u8; 4] = [0; 4];
-
+    #[task(binds = SERCOM4, priority = 4, shared = [serial], local= [buf])]
+    fn rx(mut c: rx::Context) {
         // receive events from other half
         // spawn event handler
-        let serial = c.resources.serial.as_mut().unwrap();
-        if let Serial::Rx(rx) = serial {
-            if let Ok(b) = rx.read() {
-                BUF.rotate_left(1);
-                BUF[3] = b;
+        c.shared.serial.lock(|ser_rx| {
+            if let Serial::Rx(rx) = ser_rx.as_mut().unwrap() {
+                if let Ok(b) = rx.read() {
+                    c.local.buf.rotate_left(1);
+                    c.local.buf[3] = b;
 
-                if BUF[3] == b'\n' {
-                    if let Ok(event) = de(&BUF[..]) {
-                        c.spawn.handle_event(event).unwrap();
+                    if c.local.buf[3] == b'\n' {
+                        if let Ok(event) = de(&c.local.buf[..]) {
+                            handle_event::spawn(event).unwrap();
+                        }
                     }
                 }
             }
-        }
+        });
     }
 
-    #[task(binds = USB, priority = 4, resources = [usb_dev, usb_class])]
+    #[task(binds = USB, priority = 3, shared = [usb_dev, usb_class])]
     fn usb_rx(c: usb_rx::Context) {
-        if c.resources.usb_dev.poll(&mut [c.resources.usb_class]) {
-            c.resources.usb_class.poll();
-        }
+        (c.shared.usb_dev, c.shared.usb_class).lock(|usb_dev, usb_class| {
+            if usb_dev.poll(&mut [usb_class]) {
+                usb_class.poll();
+            }
+        });
     }
 
-    #[task(priority = 3, capacity = 8, resources = [layout])]
+    #[task(priority = 2, capacity = 8, shared = [layout])]
     fn handle_event(c: handle_event::Context, event: Event) {
-        c.resources.layout.event(event);
+        c.shared.layout.event(event);
     }
 
-    #[task(priority = 3, resources = [usb_dev, usb_class, layout])]
+    #[task(priority = 2, shared = [usb_dev, usb_class, layout])]
     fn tick_keyberon(mut c: tick_keyberon::Context) {
-        let tick = c.resources.layout.tick();
+        let _tick = c.shared.layout.tick();
         // if right-hand side do nothing, events have already been sent
-        if c.resources.usb_dev.lock(|d| d.state()) == UsbDeviceState::Default {
+        if c.shared.usb_dev.lock(|d| d.state()) == UsbDeviceState::Default {
             return;
         }
 
@@ -208,36 +222,36 @@ const APP: () = {
         }*/
 
         // generate and send keyboard report
-        let report: KbHidReport = c.resources.layout.keycodes().collect();
+        let report: KbHidReport = c.shared.layout.keycodes().collect();
         if !c
-            .resources
+            .shared
             .usb_class
             .lock(|k| k.device_mut().set_keyboard_report(report.clone()))
         {
             return;
         }
-        while let Ok(0) = c.resources.usb_class.lock(|k| k.write(report.as_bytes())) {}
+        while let Ok(0) = c.shared.usb_class.lock(|k| k.write(report.as_bytes())) {}
     }
 
     #[task(binds = TC3,
-        priority = 2,
-        spawn = [handle_event, tick_keyberon],
-        resources = [serial, serial_peripherals, debouncer, timer, matrix, usb_dev],
+        priority = 1,
+        shared = [serial,  usb_dev],
+        local = [debouncer, timer, serial_peripherals, matrix]
     )]
     fn tick(mut c: tick::Context) {
-        c.resources.timer.wait().ok();
+        c.local.timer.wait().ok();
 
         let mut receiving = false;
 
         // determine send/receive half
-        c.resources.usb_dev.lock(|dev| {
+        c.shared.usb_dev.lock(|dev| {
             if dev.state() == UsbDeviceState::Configured {
                 // receiving on uart
                 receiving = true;
             }
         });
 
-        c.resources.serial.lock(|serial| {
+        c.shared.serial.lock(|serial| {
             let value = serial.take().unwrap();
             let result = match value {
                 Serial::Rx(rx) => {
@@ -246,10 +260,10 @@ const APP: () = {
                         let uart_pin = pads.free().0;
                         let pads = uart::Pads::default().tx(uart_pin);
                         let uart = uart::Config::new(
-                            &c.resources.serial_peripherals.pm,
+                            &c.local.serial_peripherals.pm,
                             sercom,
                             pads,
-                            c.resources.serial_peripherals.frequency,
+                            c.local.serial_peripherals.frequency,
                         )
                         .baud(9600.hz(), BaudMode::Fractional(Oversampling::Bits16))
                         .enable();
@@ -265,10 +279,10 @@ const APP: () = {
                         let uart_pin = pads.free().1;
                         let pads = uart::Pads::default().rx(uart_pin);
                         let mut uart = uart::Config::new(
-                            &c.resources.serial_peripherals.pm,
+                            &c.local.serial_peripherals.pm,
                             sercom,
                             pads,
-                            c.resources.serial_peripherals.frequency,
+                            c.local.serial_peripherals.frequency,
                         )
                         .baud(9600.hz(), BaudMode::Fractional(Oversampling::Bits16))
                         .enable();
@@ -284,9 +298,9 @@ const APP: () = {
 
         // check all events since last tick
         for event in c
-            .resources
+            .local
             .debouncer
-            .events(c.resources.matrix.get().get())
+            .events(c.local.matrix.get().get())
             .map(|e| {
                 if cfg!(feature = "right") {
                     e.transform(|i, j| (i, 11 - j))
@@ -296,7 +310,7 @@ const APP: () = {
             })
         {
             // send events to other keyboard half if right side
-            c.resources.serial.lock(|serial| {
+            c.shared.serial.lock(|serial| {
                 if let Serial::Tx(tx) = serial.as_mut().unwrap() {
                     for &b in &ser(event) {
                         let res = block!(tx.write(b));
@@ -305,22 +319,17 @@ const APP: () = {
                         }
                     }
                 }
-            }
+            });
 
             // schedule handle_event
             {
-                c.spawn.handle_event(event).unwrap();
+                handle_event::spawn(event).unwrap();
             }
         }
         // schedule keyberon tick
-        c.spawn.tick_keyberon().unwrap();
+        tick_keyberon::spawn().unwrap();
     }
-
-    extern "C" {
-        fn TC4();
-        fn TC5();
-    }
-};
+}
 
 fn de(bytes: &[u8]) -> Result<Event, ()> {
     match *bytes {
