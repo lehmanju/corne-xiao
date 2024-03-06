@@ -66,7 +66,7 @@ mod app {
         usb_dev: KeybUsbDevice,
         usb_class: KeybUsbClass,
         #[lock_free]
-        layout: Layout<12, 4, 3, ()>,
+        layout: Layout<12, 4, 4, ()>,
         serial: Option<Serial<UartRx, UartTx>>,
     }
 
